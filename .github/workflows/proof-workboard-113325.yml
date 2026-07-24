@@ -1,0 +1,66 @@
+name: Proof 113325 real Workboard dispatch
+
+on:
+  push:
+    branches:
+      - codex/proof-113325-real-workboard-v2
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PR_HEAD_SHA: 31d02eda9b808088e901d739ceee7ea4589b73fc
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact proof branch
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Verify product tree is the PR head
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$PR_HEAD_SHA"
+          git diff --exit-code "$PR_HEAD_SHA" HEAD -- . \
+            ':(exclude).github/proof/workboard-113325-real-dispatch.ts' \
+            ':(exclude).github/workflows/proof-workboard-113325.yml'
+          echo "verified_pr_head=${PR_HEAD_SHA:0:12} proof_only_commit=true"
+
+      - name: Set up Node and dependencies
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: 24.x
+          install-bun: "false"
+          use-actions-cache: "true"
+
+      - name: Run wall-clock SQLite dispatch proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/proof-113325
+          node --import tsx .github/proof/workboard-113325-real-dispatch.ts 2>&1 \
+            | tee .artifacts/proof-113325/runtime.log
+          grep -F "[trace] within_grace expired=true claim_present=true started=0 worker_calls=0 capacity_reserved=true" \
+            .artifacts/proof-113325/runtime.log
+          grep -F "[trace] after_grace reclaimable=true started=1 target_started=true stale_claim_present=true worker_calls=1" \
+            .artifacts/proof-113325/runtime.log
+          grep -F "[trace] persisted sqlite_reopen=true status=running execution=running run_id=proof-run-113325" \
+            .artifacts/proof-113325/runtime.log
+          grep -F "[trace] result=PASS exact_head=$PR_HEAD_SHA" \
+            .artifacts/proof-113325/runtime.log
+
+      - name: Upload redacted runtime log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: proof-113325-real-workboard-${{ github.run_id }}
+          path: .artifacts/proof-113325
+          if-no-files-found: warn
+          retention-days: 14
