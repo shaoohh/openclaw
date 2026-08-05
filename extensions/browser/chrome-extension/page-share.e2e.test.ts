@@ -1,6 +1,20 @@
+import { appendFile, cp, readFile, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { chromium, type CDPSession } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  startBrowserBridgeServer,
+  stopBrowserBridgeServer,
+} from "../src/browser/bridge-server.js";
+import {
+  browserDoctor,
+  browserStatus,
+  type BrowserDoctorReport,
+  type BrowserStatus,
+} from "../src/browser/client.js";
+import { resolveBrowserConfig } from "../src/browser/config.js";
 import {
   startExtensionRelayServer,
   type ExtensionRelayHandle,
@@ -13,6 +27,8 @@ import {
 
 declare const chrome: {
   runtime: {
+    getManifest(): { version: string };
+    reload(): void;
     sendMessage(message: Record<string, unknown>): Promise<{
       ok?: boolean;
       error?: string;
@@ -32,6 +48,8 @@ const runE2E = process.env.OPENCLAW_BROWSER_COPILOT_E2E === "1";
 const cleanups: Array<() => Promise<void>> = [];
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 let nextPopupCommandId = 0;
+const proofSourceHead = "afd28d905bbb180ef58c804440214bdae8e3ae86";
+const staleExtensionVersion = "2.0.0";
 
 type ChromeTarget = { targetId: string; type: string; url: string };
 
@@ -104,7 +122,236 @@ async function evaluateToolbarPopup<T>(
   }
 }
 
+async function readExtensionManifestVersion(extensionPath: string): Promise<string> {
+  const raw = await readFile(path.join(extensionPath, "manifest.json"), "utf8");
+  const manifest = JSON.parse(raw) as { version?: unknown };
+  if (typeof manifest.version !== "string" || manifest.version.length === 0) {
+    throw new Error("copied extension manifest does not contain a version");
+  }
+  return manifest.version;
+}
+
+async function writeExtensionManifestVersion(
+  extensionPath: string,
+  version: string,
+): Promise<void> {
+  const manifestPath = path.join(extensionPath, "manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+  manifest.version = version;
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+}
+
+async function refreshUnpackedExtensionInPlace(extensionPath: string): Promise<void> {
+  const extensionSource = path.dirname(fileURLToPath(import.meta.url));
+  await cp(extensionSource, extensionPath, {
+    recursive: true,
+    force: true,
+    filter: (source) => !source.endsWith(".test.ts"),
+  });
+}
+
+function extensionVersionCheck(report: BrowserDoctorReport) {
+  const check = report.checks.find((candidate) => candidate.id === "extension-version");
+  if (!check) {
+    throw new Error("browser Doctor omitted the extension-version check");
+  }
+  return check;
+}
+
+function redactedStatus(status: BrowserStatus) {
+  return {
+    profile: status.profile,
+    transport: status.transport,
+    running: status.running,
+    chromeExtension: status.chromeExtension,
+  };
+}
+
+async function emitRealBrowserProof(lines: string[]): Promise<void> {
+  const output = lines.map((line) => `[OPENCLAW-PROOF] ${line}`).join("\n") + "\n";
+  process.stdout.write(output);
+  const stepSummary = process.env.GITHUB_STEP_SUMMARY?.trim();
+  if (stepSummary) {
+    await appendFile(
+      stepSummary,
+      `\n## PR #119641 real unpacked-Chromium proof\n\n${lines.map((line) => `- ${line}`).join("\n")}\n`,
+      "utf8",
+    );
+  }
+}
+
 describe.runIf(runE2E)("Chrome page sharing with a real Gateway extension relay", () => {
+  it("recovers after an in-place refresh, runtime reload, and browser restart", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = tempDirs.make("openclaw-extension-version-proof-state-");
+    cleanups.push(async () => {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    });
+
+    const { ensureExtensionRelayToken } = await import(
+      "../src/browser/extension-relay/relay-auth.js"
+    );
+    const relayToken = await ensureExtensionRelayToken();
+    const relay = await startExtensionRelayServer({
+      port: 0,
+      token: relayToken,
+      onPageShare: async () => {},
+    });
+
+    let bridge: Awaited<ReturnType<typeof startBrowserBridgeServer>> | undefined;
+    cleanups.push(async () => {
+      if (bridge) {
+        const bridgeOwnsRelay = bridge.state.extensionRelays?.get("chrome") === relay;
+        await stopBrowserBridgeServer(bridge.server);
+        if (!bridgeOwnsRelay) {
+          await relay.close();
+        }
+        return;
+      }
+      await relay.close();
+    });
+
+    const resolved = resolveBrowserConfig({
+      enabled: true,
+      defaultProfile: "chrome",
+      profiles: {
+        chrome: {
+          driver: "extension",
+          cdpPort: relay.port,
+        },
+      },
+    });
+    expect(resolved.extensionRelayToken).toBe(relay.token);
+    bridge = await startBrowserBridgeServer({
+      resolved,
+      authToken: "openclaw-proof-browser-control-placeholder",
+    });
+    bridge.state.extensionRelays = new Map([["chrome", relay]]);
+
+    const unpackedExtension = await copyCopilotSidepanelExtension(tempDirs);
+    const bundledVersion = await readExtensionManifestVersion(unpackedExtension);
+    expect(bundledVersion).not.toBe(staleExtensionVersion);
+    await writeExtensionManifestVersion(unpackedExtension, staleExtensionVersion);
+
+    const userDataDir = tempDirs.make("openclaw-extension-version-proof-profile-");
+    const launchOptions: Parameters<typeof chromium.launchPersistentContext>[1] = {
+      channel: "chromium",
+      headless: true,
+      // Playwright disables extensions by default, which overrides the unpacked fixture below.
+      ignoreDefaultArgs: ["--disable-extensions"],
+      args: [
+        "--enable-unsafe-extension-debugging",
+        `--disable-extensions-except=${unpackedExtension}`,
+        `--load-extension=${unpackedExtension}`,
+      ],
+    };
+    const initialContext = await chromium.launchPersistentContext(userDataDir, launchOptions);
+    cleanups.push(async () => await initialContext.close());
+
+    const browser = initialContext.browser();
+    if (!browser) {
+      throw new Error("Chromium browser connection unavailable");
+    }
+    const browserCdp = await browser.newBrowserCDPSession();
+    const extensionId = await waitForLoadedExtensionId(browserCdp, unpackedExtension);
+    const pairingPage = initialContext.pages()[0] ?? (await initialContext.newPage());
+    await pairingPage.goto(`chrome-extension://${extensionId}/popup.html`);
+    const worker =
+      initialContext.serviceWorkers()[0] ??
+      (await initialContext.waitForEvent("serviceworker"));
+
+    const pairing = await pairingPage.evaluate(
+      async (pairingString) => await chrome.runtime.sendMessage({ type: "pair", pairingString }),
+      `ws://127.0.0.1:${relay.port}/extension#${relay.token}`,
+    );
+    expect(pairing).toEqual({ ok: true });
+    await expect
+      .poll(() => relay.bridge.identity?.extensionVersion, { timeout: 10_000 })
+      .toBe(staleExtensionVersion);
+
+    const beforeStatus = await browserStatus(bridge.baseUrl, { profile: "chrome" });
+    const beforeDoctor = await browserDoctor(bridge.baseUrl, { profile: "chrome" });
+    expect(redactedStatus(beforeStatus)).toEqual({
+      profile: "chrome",
+      transport: "extension",
+      running: true,
+      chromeExtension: {
+        runningVersion: staleExtensionVersion,
+        bundledVersion,
+        versionState: "mismatch",
+      },
+    });
+    const beforeVersionCheck = extensionVersionCheck(beforeDoctor);
+    expect(beforeVersionCheck).toMatchObject({
+      status: "warn",
+      summary: `running ${staleExtensionVersion}; bundled ${bundledVersion} (mismatch)`,
+    });
+
+    await refreshUnpackedExtensionInPlace(unpackedExtension);
+    expect(await readExtensionManifestVersion(unpackedExtension)).toBe(bundledVersion);
+    const workerClosed = worker.waitForEvent("close", { timeout: 15_000 });
+    await worker.evaluate(() => {
+      setTimeout(() => chrome.runtime.reload(), 0);
+    });
+    await workerClosed;
+    await initialContext.close();
+    await expect.poll(() => relay.bridge.identity, { timeout: 10_000 }).toBeNull();
+
+    const reloadedContext = await chromium.launchPersistentContext(userDataDir, launchOptions);
+    cleanups.push(async () => await reloadedContext.close());
+    const reloadedBrowser = reloadedContext.browser();
+    if (!reloadedBrowser) {
+      throw new Error("Reloaded Chromium browser connection unavailable");
+    }
+    const reloadedBrowserCdp = await reloadedBrowser.newBrowserCDPSession();
+    const reloadedExtensionId = await waitForLoadedExtensionId(
+      reloadedBrowserCdp,
+      unpackedExtension,
+    );
+    expect(reloadedExtensionId).toBe(extensionId);
+    const wakePage = reloadedContext.pages()[0] ?? (await reloadedContext.newPage());
+    await wakePage.goto(`chrome-extension://${reloadedExtensionId}/popup.html`);
+    expect(await wakePage.evaluate(() => chrome.runtime.getManifest().version)).toBe(
+      bundledVersion,
+    );
+    await wakePage.evaluate(async () => {
+      await chrome.runtime.sendMessage({ type: "getStatus" });
+    });
+    await expect
+      .poll(() => relay.bridge.identity?.extensionVersion, { timeout: 15_000 })
+      .toBe(bundledVersion);
+
+    const afterStatus = await browserStatus(bridge.baseUrl, { profile: "chrome" });
+    const afterDoctor = await browserDoctor(bridge.baseUrl, { profile: "chrome" });
+    expect(redactedStatus(afterStatus)).toEqual({
+      profile: "chrome",
+      transport: "extension",
+      running: true,
+      chromeExtension: {
+        runningVersion: bundledVersion,
+        bundledVersion,
+        versionState: "match",
+      },
+    });
+    const afterVersionCheck = extensionVersionCheck(afterDoctor);
+    expect(afterVersionCheck).toMatchObject({
+      status: "pass",
+      summary: `running ${bundledVersion}; bundled ${bundledVersion} (match)`,
+    });
+
+    const browserVersion = relay.bridge.identity?.browserVersion ?? "Chrome/unknown";
+    await emitRealBrowserProof([
+      `SOURCE production-head=${proofSourceHead}; browser=${browserVersion}; isolated temporary profile`,
+      `BEFORE status=${JSON.stringify(redactedStatus(beforeStatus))}; doctor=WARN extension-version: ${beforeVersionCheck.summary}`,
+      "ACTION refreshed in place; chrome.runtime.reload() closed the stale worker; then fully quit and reopened Chromium with the same isolated profile and unpacked path; pairing storage and extension id persisted",
+      `AFTER status=${JSON.stringify(redactedStatus(afterStatus))}; doctor=OK extension-version: ${afterVersionCheck.summary}`,
+    ]);
+  });
+
   it.each([
     { label: "relay disconnection", unpair: false },
     { label: "user unpair", unpair: true },
